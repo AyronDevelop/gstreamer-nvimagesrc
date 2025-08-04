@@ -385,10 +385,22 @@ nvimageutil_fbccontext_get(GstXContext *xcontext)
 
         createCaptureParams.dwVersion                   = NVFBC_CREATE_CAPTURE_SESSION_PARAMS_VER;
         createCaptureParams.eCaptureType                = NVFBC_CAPTURE_TO_GL;
-        createCaptureParams.bWithCursor                 = xcontext->show_pointer;
+        // FIX: Disable cursor to support Direct Capture
+        createCaptureParams.bWithCursor                 = NVFBC_FALSE;  // xcontext->show_pointer;
         createCaptureParams.frameSize                   = frameSize;
         createCaptureParams.eTrackingType               = NVFBC_TRACKING_SCREEN;
         createCaptureParams.bDisableAutoModesetRecovery = NVFBC_TRUE;
+        // NvFBC settings for accurate framerate
+        uint32_t target_fps = (xcontext->fps_n > 0 && xcontext->fps_d > 0) ? 
+                              (xcontext->fps_n / xcontext->fps_d) : 60;
+        // FIX: Push Model is REQUIRED for Direct Capture and minimal latency!
+        uint32_t sampling_ms = (1000 / target_fps);  // Ignored when Push Model = TRUE
+        createCaptureParams.dwSamplingRateMs = sampling_ms;
+        createCaptureParams.bPushModel = NVFBC_TRUE;   // Push model for Direct Capture!
+        createCaptureParams.bAllowDirectCapture = NVFBC_TRUE;  // Direct capture for performance
+        
+        g_debug("NvFBC capture: target_fps=%d, dwSamplingRateMs=%d, bPushModel=%d", 
+                  target_fps, sampling_ms, createCaptureParams.bPushModel);
 
         fbcStatus = xcontext->pFn.nvFBCCreateCaptureSession(xcontext->fbcHandle, &createCaptureParams);
         
@@ -432,10 +444,10 @@ nvimageutil_fbccontext_get(GstXContext *xcontext)
 
         presetConfig.version = NV_ENC_PRESET_CONFIG_VER;
         presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
-        encStatus = xcontext->pEncFn.nvEncGetEncodePresetConfig(xcontext->encoder,
-                                                  encodeGuid,
-                                                  NV_ENC_PRESET_LOW_LATENCY_HQ_GUID,
-                                                  &presetConfig);
+                encStatus = xcontext->pEncFn.nvEncGetEncodePresetConfig(xcontext->encoder,
+                                                                encodeGuid,
+                                                                NV_ENC_PRESET_LOW_LATENCY_DEFAULT_GUID,
+                                                                &presetConfig);
         if (encStatus != NV_ENC_SUCCESS) {
                 g_error ("Cannot get NVENC preset config %d", encStatus);
                 return FALSE;
@@ -452,19 +464,32 @@ nvimageutil_fbccontext_get(GstXContext *xcontext)
         presetConfig.presetCfg.encodeCodecConfig.h264Config.outputPictureTimingSEI = 1;
         presetConfig.presetCfg.encodeCodecConfig.h264Config.chromaFormatIDC        = 1;
         presetConfig.presetCfg.encodeCodecConfig.h264Config.level                  = NV_ENC_LEVEL_AUTOSELECT;
-        presetConfig.presetCfg.encodeCodecConfig.h264Config.idrPeriod              = 0;
-	presetConfig.presetCfg.gopLength 					   = NVENC_INFINITE_GOPLENGTH;
+        // SMOOTHNESS: Reduce GOP for more frequent I-frames and smoothness
+        uint32_t gop_size = (target_fps >= 60) ? 15 : (target_fps >= 30) ? 30 : 60;
+        presetConfig.presetCfg.encodeCodecConfig.h264Config.idrPeriod              = gop_size;
+	presetConfig.presetCfg.gopLength 					   = gop_size;
+        
+        // FORCE set VUI timing info for H.264 headers
+        presetConfig.presetCfg.encodeCodecConfig.h264Config.h264VUIParameters.timingInfoPresentFlag = 1;
+        presetConfig.presetCfg.encodeCodecConfig.h264Config.h264VUIParameters.numUnitInTicks = xcontext->fps_d;
+        presetConfig.presetCfg.encodeCodecConfig.h264Config.h264VUIParameters.timeScale = xcontext->fps_n * 2;
+
 
 	memset(&initParams, 0, sizeof(initParams));
         initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
         initParams.encodeGUID = encodeGuid;
-        initParams.presetGUID = NV_ENC_PRESET_LOW_LATENCY_HQ_GUID;
+        initParams.presetGUID = NV_ENC_PRESET_LOW_LATENCY_DEFAULT_GUID;
         initParams.encodeConfig = &presetConfig.presetCfg;
         initParams.encodeWidth = frameSize.w;
         initParams.encodeHeight = frameSize.h;
         initParams.frameRateNum = xcontext->fps_n;
         initParams.frameRateDen = xcontext->fps_d;
         initParams.enablePTD = 1;
+        
+        g_debug("NVENC encoder: frameRateNum=%d, frameRateDen=%d, target_fps=%d", 
+                  xcontext->fps_n, xcontext->fps_d, target_fps);
+        g_debug("NVENC GOP: gopLength=%d, idrPeriod=%d", 
+                  presetConfig.presetCfg.gopLength, presetConfig.presetCfg.encodeCodecConfig.h264Config.idrPeriod);
 
         encStatus = xcontext->pEncFn.nvEncInitializeEncoder(xcontext->encoder, &initParams);
         if (encStatus != NV_ENC_SUCCESS) {
@@ -617,6 +642,7 @@ gst_nvimageutil_nvimage_new (GstXContext * xcontext, GstElement * parent, guint 
         GstBuffer                    *nvimage = NULL;
         GstMetaNVimage               *meta;
         NVFBC_TOGL_GRAB_FRAME_PARAMS grabParams;
+        NVFBC_FRAME_GRAB_INFO        frameInfo;  // Добавляем для проверки Direct Capture
         NVFBCSTATUS                  fbcStatus;
         NVENCSTATUS                  encStatus;
         NV_ENC_LOCK_BITSTREAM        lockParams;
@@ -631,7 +657,7 @@ gst_nvimageutil_nvimage_new (GstXContext * xcontext, GstElement * parent, guint 
                 xcontext->fps_d = fps_d;
                 xcontext->bitrate = bitrate;
                 xcontext->show_pointer = show_pointer;
-                g_warning ("Recreating FBCNVENC pipeline, parametres change: bitrate: %d, showpointer %d, fps: %f", bitrate, show_pointer, ((double)fps_n)/fps_d);
+                g_debug ("Recreating FBCNVENC pipeline, parametres change: bitrate: %d, showpointer %d, fps: %f", bitrate, show_pointer, ((double)fps_n)/fps_d);
                 if(!nvimageutil_fbccontext_clear(xcontext)) {
                         g_error("Cannot clear context. Flow error.");
                         return NULL;
@@ -651,10 +677,28 @@ gst_nvimageutil_nvimage_new (GstXContext * xcontext, GstElement * parent, guint 
 
 restart:
         memset(&grabParams, 0, sizeof(grabParams));
+        memset(&frameInfo, 0, sizeof(frameInfo));
+        
         grabParams.dwVersion = NVFBC_TOGL_GRAB_FRAME_PARAMS_VER;
-        grabParams.dwFlags = NVFBC_TOGL_GRAB_FLAGS_NOWAIT | NVFBC_TOGL_GRAB_FLAGS_FORCE_REFRESH;
+        grabParams.pFrameGrabInfo = &frameInfo;  // Add for getting Direct Capture info
+        
+        // BALANCE: Performance + stability + Push Model optimization
+        grabParams.dwFlags = NVFBC_TOGL_GRAB_FLAGS_NOWAIT | 
+                             NVFBC_TOGL_GRAB_FLAGS_FORCE_REFRESH |
+                             NVFBC_TOGL_GRAB_FLAGS_NOWAIT_IF_NEW_FRAME_READY;  // Perfect for Push Model
 
         fbcStatus = xcontext->pFn.nvFBCToGLGrabFrame(xcontext->fbcHandle, &grabParams);
+        
+        // CHECK: Is Direct Capture active? (verbose mode only)
+        if (fbcStatus == NVFBC_SUCCESS) {
+                if (frameInfo.bDirectCapture) {
+                        g_debug("✅ Direct Capture ACTIVE - minimal latency!");
+                } else {
+                        g_debug("⚠️  Direct Capture NOT active - check fullscreen/compositor");
+                }
+                g_debug("Frame timing info: dwWidth=%u, dwHeight=%u", 
+                          frameInfo.dwWidth, frameInfo.dwHeight);
+        }
 
         if (fbcStatus == NVFBC_ERR_MUST_RECREATE) {
                 g_warning ("Recreating FBCNVENC pipeline, must recreate status.");
@@ -692,8 +736,21 @@ restart:
         xcontext->encParams.frameIdx = frame;
         xcontext->encParams.inputDuration = (1000000000L*xcontext->fps_d)/xcontext->fps_n; 
         xcontext->encParams.inputTimeStamp = frame*xcontext->encParams.inputDuration;
+        
+        // DIAGNOSTICS: Non-blocking logging for smoothness analysis
+        static gint64 last_timestamp = 0;
+        gint64 current_time = g_get_real_time();
+        gint64 target_interval_us = xcontext->encParams.inputDuration / 1000;  // ns -> μs
+        
+        if (last_timestamp > 0) {
+            gint64 real_interval = current_time - last_timestamp;
+            // DIAGNOSTICS: frame timing (verbose mode only)
+            g_debug("Frame %ld: expected_interval=%ldμs, real_interval=%ldμs", 
+                      frame, target_interval_us, real_interval);
+        }
+        last_timestamp = current_time;
         if(forcekeyframe) {
-                g_warning("Forced keyframe");
+                g_debug("Forced keyframe");
                 xcontext->encParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
         } else {
                 xcontext->encParams.encodePicFlags = 0;

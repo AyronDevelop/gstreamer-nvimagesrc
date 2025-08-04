@@ -50,8 +50,6 @@
 #include <gst/gst.h>
 #include <gst/video/video.h>
 
-#include "gst/glib-compat-private.h"
-
 GST_DEBUG_CATEGORY_STATIC (gst_debug_nvimage_src);
 #define GST_CAT_DEFAULT gst_debug_nvimage_src
 
@@ -157,9 +155,7 @@ gst_nvimage_src_create (GstPushSrc * bs, GstBuffer ** buf)
                 return GST_FLOW_NOT_NEGOTIATED;     /* FPS must be > 0 */
         }
 
-        if (s->frame == 0) {
-                sleep(2);
-        }
+        // Removed sleep(2) delay to improve responsiveness
 
         /* Now, we might need to wait for the next multiple of the fps
          * before capturing */
@@ -176,50 +172,11 @@ gst_nvimage_src_create (GstPushSrc * bs, GstBuffer ** buf)
         pts = next_capture_ts = gst_clock_get_time (GST_ELEMENT_CLOCK (s));
         next_capture_ts -= base_time;
 
-        /* Figure out which 'frame number' position we're at, based on the cur time
-         * and frame rate */
-        next_frame_no = gst_util_uint64_scale (next_capture_ts, s->fps_n, GST_SECOND * s->fps_d);
-        if (next_frame_no == s->last_frame_no) {
-                GstClockID id;
-                GstClockReturn ret;
-
-                /* Need to wait for the next frame */
-                next_frame_no += 1;
-
-                /* Figure out what the next frame time is */
-                next_capture_ts = gst_util_uint64_scale (next_frame_no,
-                        s->fps_d * GST_SECOND, s->fps_n);
-
-                id = gst_clock_new_single_shot_id (GST_ELEMENT_CLOCK (s), next_capture_ts + base_time);
-                s->clock_id = id;
-
-                /* release the object lock while waiting */
-                GST_OBJECT_UNLOCK (s);
-
-                GST_DEBUG_OBJECT (s, "Waiting for next frame time %" G_GUINT64_FORMAT, next_capture_ts);
-                ret = gst_clock_id_wait (id, NULL);
-                GST_OBJECT_LOCK (s);
-
-                gst_clock_id_unref (id);
-                s->clock_id = NULL;
-                if (ret == GST_CLOCK_UNSCHEDULED) {
-                        /* Got woken up by the unlock function */
-                        GST_OBJECT_UNLOCK (s);
-                        return GST_FLOW_FLUSHING;
-                }
-                /* Duration is a complete 1/fps frame duration */
-                dur = gst_util_uint64_scale_int (GST_SECOND, s->fps_d, s->fps_n);
-        } else {
-                GstClockTime next_frame_ts;
-
-                GST_DEBUG_OBJECT (s, "No need to wait for next frame time %"
-                        G_GUINT64_FORMAT " next frame = %" G_GINT64_FORMAT " prev = %"
-                        G_GINT64_FORMAT, next_capture_ts, next_frame_no, s->last_frame_no);
-                next_frame_ts = gst_util_uint64_scale (next_frame_no + 1, s->fps_d * GST_SECOND, s->fps_n);
-                /* Frame duration is from now until the next expected capture time */
-                dur = next_frame_ts - next_capture_ts;
-        }
-        //dur = gst_util_uint64_scale_int (GST_SECOND, s->fps_d, s->fps_n);
+        /* DISABLED forced GStreamer waiting - let NvFBC work at maximum speed */
+        next_frame_no = s->last_frame_no + 1;
+        
+        /* EXPERIMENTAL: Remove forced duration - let NvFBC manage timing itself */
+        dur = GST_CLOCK_TIME_NONE; // gst_util_uint64_scale_int (GST_SECOND, s->fps_d, s->fps_n);
         s->last_frame_no = next_frame_no;
         GST_OBJECT_UNLOCK (s);
 
@@ -240,7 +197,8 @@ gst_nvimage_src_create (GstPushSrc * bs, GstBuffer ** buf)
 
         *buf = image;
         GST_BUFFER_DTS (*buf) = GST_CLOCK_TIME_NONE; //pts+s->last_frame_no;
-        GST_BUFFER_PTS (*buf) = next_capture_ts; //pts+s->last_frame_no; // next_capture_ts;
+        // EXPERIMENTAL: Remove forced timestamps - let NvFBC control
+        GST_BUFFER_PTS (*buf) = GST_CLOCK_TIME_NONE; // next_capture_ts; 
         GST_BUFFER_DURATION (*buf) = dur;
 
         GST_DEBUG_OBJECT (s, "Sending frame time %"
@@ -271,13 +229,9 @@ gst_nvimage_src_set_property (GObject * object, guint prop_id, const GValue * va
                         break;
                 case PROP_FPS:
                         fps = g_value_get_double(value);
-                        if (fps == (guint)fps) {
-                                src->fps_n = (guint)fps;
-                                src->fps_d = 1;
-                        } else {
-                                src->fps_n = fps*1000;
-                                src->fps_d = 1000;
-                        }
+                        // Simple and accurate FPS handling without unnecessary multiplications
+                        src->fps_n = (guint)(fps + 0.5);  // Round to nearest integer
+                        src->fps_d = 1;
                         break;
                 default:
                         g_warning("Unknown property %d", prop_id);
@@ -385,13 +339,21 @@ gst_nvimage_src_fixate (GstBaseSrc * bsrc, GstCaps * caps)
 {
         gint i;
         GstStructure *structure;
+        GstNVimageSrc *src = GST_NVIMAGE_SRC (bsrc);
+        gint fps_n = 25, fps_d = 1;  // default fallback
 
         caps = gst_caps_make_writable (caps);
+
+        // Use user-specified fps if available and valid
+        if (src->fps_n > 0 && src->fps_d > 0) {
+                fps_n = src->fps_n;
+                fps_d = src->fps_d;
+        }
 
         for (i = 0; i < gst_caps_get_size (caps); ++i) {
                 structure = gst_caps_get_structure (caps, i);
 
-                gst_structure_fixate_field_nearest_fraction (structure, "framerate", 25, 1);
+                gst_structure_fixate_field_nearest_fraction (structure, "framerate", fps_n, fps_d);
         }
         caps = GST_BASE_SRC_CLASS (parent_class)->fixate (bsrc, caps);
 
